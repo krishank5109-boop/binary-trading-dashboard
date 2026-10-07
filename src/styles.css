@@ -1,0 +1,423 @@
+import { useMemo, useState } from 'react';
+
+const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+const round2 = (value) => Number(value.toFixed(2));
+
+const generateCandles = (count = 96) => {
+  let start = 0.8641;
+  let candles = [];
+
+  for (let i = 0; i < count; i += 1) {
+    const drift = (Math.sin(i / 5) + Math.cos(i / 3)) * 0.0007;
+    const trend = i * 0.00002;
+    const open = start + drift;
+    const close = open + (Math.random() - 0.48) * 0.0014 + trend * 0.2;
+    const high = Math.max(open, close) + Math.random() * 0.0009;
+    const low = Math.min(open, close) - Math.random() * 0.0009;
+
+    candles.push({
+      index: i,
+      time: i,
+      open: Number(open.toFixed(5)),
+      high: Number(high.toFixed(5)),
+      low: Number(low.toFixed(5)),
+      close: Number(close.toFixed(5)),
+      volume: 110 + Math.round(Math.random() * 180),
+    });
+
+    start = close;
+  }
+
+  return candles;
+};
+
+const average = (values) => values.reduce((sum, item) => sum + item, 0) / values.length;
+
+const ema = (values, period) => {
+  if (!values.length) return 0;
+  const multiplier = 2 / (period + 1);
+  let result = values[0];
+
+  for (let i = 1; i < values.length; i += 1) {
+    result = values[i] * multiplier + result * (1 - multiplier);
+  }
+
+  return result;
+};
+
+const rsi = (values, period = 14) => {
+  if (values.length < period + 1) return 50;
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let i = 1; i <= period; i += 1) {
+    const diff = values[i] - values[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses += Math.abs(diff);
+  }
+
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+
+  if (avgLoss === 0) return 100;
+  if (avgGain === 0) return 0;
+
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+};
+
+const macdSeries = (values) => {
+  const fast = ema(values, 12);
+  const slow = ema(values, 26);
+  const macdLine = fast - slow;
+  const signalLine = macdLine * 0.5 + average(values.slice(-7)) * 0.5;
+  return { macdLine, signalLine, histogram: macdLine - signalLine };
+};
+
+const adx = (values, period = 14) => {
+  if (values.length < period + 2) return 18;
+  const diffs = values.map((value, index, arr) => (index === 0 ? 0 : value - arr[index - 1]));
+  const avgMove = average(diffs.slice(-period));
+  return clamp(Math.abs(avgMove) * 1000, 0, 100);
+};
+
+const supertrend = (candles, atrPeriod = 10, multiplier = 2) => {
+  if (candles.length < atrPeriod) return 1;
+
+  const atr = candles.slice(-atrPeriod).reduce((sum, candle) => {
+    const trueRange = Math.max(
+      candle.high - candle.low,
+      Math.abs(candle.high - (candles[candle.index - 1]?.close ?? candle.close)),
+      Math.abs(candle.low - (candles[candle.index - 1]?.close ?? candle.close))
+    );
+    return sum + trueRange;
+  }, 0) / atrPeriod;
+
+  return atr > 0 ? (multiplier * atr) / 1000 : 1;
+};
+
+const buildChartData = (candles) => {
+  const closes = candles.map((c) => c.close);
+  const ema200 = ema(closes, 200);
+  const currentRsi = rsi(closes, 14);
+  const macd = macdSeries(closes);
+  const adxValue = adx(closes, 14);
+  const st = supertrend(candles);
+
+  return candles.map((candle, index) => ({
+    ...candle,
+    ema200,
+    rsi: rsi(closes.slice(0, index + 1), 14),
+    macdLine: index === candles.length - 1 ? macd.macdLine : macd.macdLine * 0.8,
+    signalLine: index === candles.length - 1 ? macd.signalLine : macd.signalLine * 0.8,
+    adxValue,
+    supertrend: st,
+  }));
+};
+
+const getSignalState = (chartData, mode) => {
+  const last = chartData[chartData.length - 1];
+  const prev = chartData[chartData.length - 2] || last;
+  const close = last.close;
+  const ema = last.ema200;
+  const rsiValue = last.rsi;
+  const macdValue = last.macdLine - last.signalLine;
+  const nearBottom = close < ema * 0.997;
+  const nearTop = close > ema * 1.003;
+
+  const threshold = {
+    High: 0.35,
+    Medium: 0.2,
+    Strict: 0.45,
+  }[mode] ?? 0.25;
+
+  const recentSignals = chartData.slice(-8);
+  const buyCount = recentSignals.filter((entry) => entry.close > entry.ema200).length;
+  const sellCount = recentSignals.filter((entry) => entry.close < entry.ema200).length;
+
+  const buyCondition =
+    close > ema &&
+    macdValue > threshold &&
+    rsiValue > 52 &&
+    close > prev.close &&
+    buyCount >= sellCount;
+
+  const sellCondition =
+    close < ema &&
+    macdValue < -threshold &&
+    rsiValue < 48 &&
+    close < prev.close &&
+    sellCount >= buyCount;
+
+  const trend = close >= ema ? 'Bullish' : 'Bearish';
+
+  if (buyCondition || (nearTop && macdValue > 0.1 && rsiValue > 55)) {
+    return {
+      type: 'BUY',
+      trend,
+      signalStrength: clamp(70 + (close - ema) * 5000 + Math.abs(macdValue) * 40, 60, 96),
+      confidence: clamp(70 + (rsiValue - 50) * 1.5 + Math.abs(macdValue) * 20, 65, 96),
+      label: 'BUY',
+      support: Math.min(...chartData.slice(-12).map((item) => item.low)),
+      resistance: Math.max(...chartData.slice(-12).map((item) => item.high)),
+    };
+  }
+
+  if (sellCondition || (nearBottom && macdValue < -0.1 && rsiValue < 45)) {
+    return {
+      type: 'SELL',
+      trend,
+      signalStrength: clamp(70 + (ema - close) * 5000 + Math.abs(macdValue) * 40, 60, 96),
+      confidence: clamp(70 + (50 - rsiValue) * 1.5 + Math.abs(macdValue) * 20, 65, 96),
+      label: 'SELL',
+      support: Math.min(...chartData.slice(-12).map((item) => item.low)),
+      resistance: Math.max(...chartData.slice(-12).map((item) => item.high)),
+    };
+  }
+
+  return {
+    type: 'WAIT',
+    trend,
+    signalStrength: 48,
+    confidence: 52,
+    label: 'WAIT',
+    support: Math.min(...chartData.slice(-12).map((item) => item.low)),
+    resistance: Math.max(...chartData.slice(-12).map((item) => item.high)),
+  };
+};
+
+function App() {
+  const [mode, setMode] = useState('High');
+  const [showIndicators, setShowIndicators] = useState(true);
+  const [showZones, setShowZones] = useState(true);
+  const [seed, setSeed] = useState(1);
+
+  const chartData = useMemo(() => {
+    const raw = generateCandles(96 + seed * 6);
+    return buildChartData(raw);
+  }, [seed]);
+
+  const signal = getSignalState(chartData, mode);
+  const lastClose = chartData[chartData.length - 1]?.close ?? 0;
+  const minPrice = Math.min(...chartData.map((candle) => candle.low));
+  const maxPrice = Math.max(...chartData.map((candle) => candle.high));
+  const priceRange = maxPrice - minPrice || 0.001;
+
+  const signalCandles = chartData.filter((candle) => {
+    const isBuy = candle.close > candle.ema200 && candle.rsi > 55 && candle.close > candle.open;
+    const isSell = candle.close < candle.ema200 && candle.rsi < 45 && candle.close < candle.open;
+    return isBuy || isSell;
+  });
+
+  const support = Math.min(...chartData.slice(-18).map((item) => item.low));
+  const resistance = Math.max(...chartData.slice(-18).map((item) => item.high));
+
+  const chartConfig = {
+    width: 840,
+    height: 420,
+    padding: 14,
+    candleWidth: 12,
+  };
+
+  const priceLabels = Array.from({ length: 6 }, (_, index) => {
+    const value = maxPrice - (index / 5) * priceRange;
+    return value.toFixed(5);
+  });
+
+  return (
+    <div className="app-shell">
+      <div className="screen">
+        <header className="topbar">
+          <div className="time-block">
+            <span className="time">10:04</span>
+            <span className="pair-name">Nexa Pro</span>
+          </div>
+
+          <div className="status-group">
+            <div className="badge">VO</div>
+            <div className="badge small">LTE+</div>
+            <div className="icon-box">▣</div>
+          </div>
+        </header>
+
+        <div className="chart-card">
+          <div className="chart-header-row">
+            <div className="mode-buttons">
+              {['High', 'Medium', 'Strict'].map((item) => (
+                <button
+                  key={item}
+                  className={item === mode ? 'active' : ''}
+                  onClick={() => setMode(item)}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+            <div className="price-tag">{lastClose.toFixed(5)}</div>
+          </div>
+
+          <div className="chart-area">
+            <svg viewBox={`0 0 ${chartConfig.width} ${chartConfig.height}`} className="chart-svg" role="img" aria-label="Trading chart">
+              {priceLabels.map((price, index) => {
+                const y = chartConfig.padding + (index / 5) * (chartConfig.height - chartConfig.padding * 2);
+                return (
+                  <g key={price}>
+                    <line x1="0" y1={y} x2={chartConfig.width} y2={y} className="grid-line" />
+                    <text x={chartConfig.width - 2} y={y + 4} textAnchor="end" className="price-label">
+                      {price}
+                    </text>
+                  </g>
+                );
+              })}
+
+              {showZones && (
+                <>
+                  <line x1="0" y1={chartConfig.padding + ((maxPrice - support) / priceRange) * (chartConfig.height - chartConfig.padding * 2)} x2={chartConfig.width} y2={chartConfig.padding + ((maxPrice - support) / priceRange) * (chartConfig.height - chartConfig.padding * 2)} className="zone-line support-zone" />
+                  <line x1="0" y1={chartConfig.padding + ((maxPrice - resistance) / priceRange) * (chartConfig.height - chartConfig.padding * 2)} x2={chartConfig.width} y2={chartConfig.padding + ((maxPrice - resistance) / priceRange) * (chartConfig.height - chartConfig.padding * 2)} className="zone-line resistance-zone" />
+                </>
+              )}
+
+              {showIndicators && (
+                <path
+                  d={chartData
+                    .map((candle, index) => {
+                      const x = chartConfig.padding + index * 7.4;
+                      const y = chartConfig.padding + ((maxPrice - candle.ema200) / priceRange) * (chartConfig.height - chartConfig.padding * 2);
+                      return `${index === 0 ? 'M' : 'L'} ${x} ${y}`;
+                    })
+                    .join(' ')}
+                  className="ema-line"
+                />
+              )}
+
+              {chartData.map((candle, index) => {
+                const x = chartConfig.padding + index * 7.4;
+                const yOpen = chartConfig.padding + ((maxPrice - candle.open) / priceRange) * (chartConfig.height - chartConfig.padding * 2);
+                const yClose = chartConfig.padding + ((maxPrice - candle.close) / priceRange) * (chartConfig.height - chartConfig.padding * 2);
+                const yHigh = chartConfig.padding + ((maxPrice - candle.high) / priceRange) * (chartConfig.height - chartConfig.padding * 2);
+                const yLow = chartConfig.padding + ((maxPrice - candle.low) / priceRange) * (chartConfig.height - chartConfig.padding * 2);
+                const isBull = candle.close >= candle.open;
+
+                return (
+                  <g key={`${candle.time}-${candle.open}`}>
+                    <line x1={x + 5} y1={yHigh} x2={x + 5} y2={yLow} className={isBull ? 'wick-up' : 'wick-down'} />
+                    <rect
+                      x={x}
+                      y={Math.min(yOpen, yClose)}
+                      width={chartConfig.candleWidth}
+                      height={Math.max(Math.abs(yClose - yOpen), 3)}
+                      rx="1"
+                      className={isBull ? 'candle bull' : 'candle bear'}
+                    />
+                    {index > chartData.length - 10 && (
+                      <text
+                        x={x + 8}
+                        y={yClose - 18}
+                        className={isBull ? 'signal-tag buy' : 'signal-tag sell'}
+                      >
+                        {isBull ? 'BUY' : 'SELL'}
+                      </text>
+                    )}
+                  </g>
+                );
+              })}
+
+              {signal.type !== 'WAIT' && (
+                <g>
+                  <path
+                    d={chartData
+                      .map((candle, index) => {
+                        const x = chartConfig.padding + index * 7.4;
+                        const y = chartConfig.padding + ((maxPrice - candle.close) / priceRange) * (chartConfig.height - chartConfig.padding * 2);
+                        return `${index === 0 ? 'M' : 'L'} ${x} ${y}`;
+                      })
+                      .join(' ')}
+                    className="trend-line"
+                  />
+
+                  <circle
+                    cx={chartConfig.width - 120}
+                    cy={chartConfig.padding + ((maxPrice - lastClose) / priceRange) * (chartConfig.height - chartConfig.padding * 2)}
+                    r="5"
+                    className="signal-dot"
+                  />
+                </g>
+              )}
+            </svg>
+          </div>
+
+          <div className="info-bar">
+            <div className="info-left">
+              <span className="pair">EURGBP</span>
+              <span className="timeframe">1m</span>
+            </div>
+            <div className="signal-state">
+              <span className={`pulse ${signal.type.toLowerCase()}`}></span>
+              {signal.type}
+            </div>
+          </div>
+        </div>
+
+        <div className="bottom-panel">
+          <div className="summary-card">
+            <div className="summary-header">
+              <span>Signal Summary</span>
+              <span className={`tag ${signal.type.toLowerCase()}`}>{signal.label}</span>
+            </div>
+
+            <div className="stat-grid">
+              <div>
+                <label>Trend</label>
+                <strong>{signal.trend}</strong>
+              </div>
+              <div>
+                <label>Strength</label>
+                <strong>{Math.round(signal.signalStrength)}%</strong>
+              </div>
+              <div>
+                <label>Confidence</label>
+                <strong>{Math.round(signal.confidence)}%</strong>
+              </div>
+              <div>
+                <label>Last Candle</label>
+                <strong>{signal.type}</strong>
+              </div>
+            </div>
+
+            <div className="level-row">
+              <div>
+                <label>S/R Zone</label>
+                <span>{support.toFixed(5)} / {resistance.toFixed(5)}</span>
+              </div>
+              <div>
+                <label>Mode</label>
+                <span>{mode}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="controls-card">
+            <div className="toggle-row">
+              <span>Indicators</span>
+              <button className={showIndicators ? 'toggle on' : 'toggle'} onClick={() => setShowIndicators(!showIndicators)}>
+                {showIndicators ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            <div className="toggle-row">
+              <span>Support / Resistance</span>
+              <button className={showZones ? 'toggle on' : 'toggle'} onClick={() => setShowZones(!showZones)}>
+                {showZones ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            <button className="refresh-button" onClick={() => setSeed((current) => current + 1)}>
+              Refresh Data
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
